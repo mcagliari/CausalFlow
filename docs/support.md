@@ -2,7 +2,7 @@
 
 Unconditional normalizing flow on p(X) (or p(X, T) in scenario C), used to decide whether
 a covariate vector lies inside the training data's support before estimating an effect.
-Used by: [`causalflow.md`](causalflow.md). Status: upstream code at `e73a4f6` (unmodified).
+Used by: [`causalflow.md`](causalflow.md). Status: upstream `e73a4f6` + two 3a fixes (below).
 
 ## Public API
 
@@ -34,9 +34,10 @@ CausalFlow classes construct `Support()` without passing their device.
 - **Validation split**: random 90/10 by row, same leak concern as the outcome flows when rows
   repeat per zipcode (see `causalflow.md`, "Choosing the validation grouping").
 - `np.random.seed(0)` inside `_train` resets numpy's global random state as a side effect.
-- Known bugs (workspace `Plan.md` §3): `warnings` not imported; `_train` calls
-  `set_architecture(..., nblocks=5)` but the kwarg is `nblock`, so training without first
-  calling `set_architecture` fails.
+- Fixed in 3a (2026-11-18): `warnings` import; `_train`'s default
+  `set_architecture(..., nblock=5)` kwarg name.
+- `self._flow` is reused: calling `train` twice on the same `Support` continues from the
+  previous weights (the CausalFlow classes always build a fresh `Support`).
 
 ## Cross-references
 - Workspace `Plan.md` §3.
