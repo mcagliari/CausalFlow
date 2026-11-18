@@ -72,7 +72,7 @@ def Objective(trial):
             nblock=n_blocks) 
     
     # run trianing
-    flow, best_valid_loss = Sup.train(train_data, 
+    flow, best_valid_loss = Sup._train(train_data, 
             batch_size=50, 
             learning_rate=lr, 
             num_iter=300,

@@ -4,9 +4,10 @@ module for checking support
 
 
 '''
-import numpy as np 
+import numpy as np
 
 import copy
+import warnings
 import torch
 from nflows import transforms, distributions, flows
 from torch import optim
@@ -203,7 +204,7 @@ class Support(object):
         # training the flow 
         # specify the NDE architecture
         if self._flow is None: # arbitrary architecture
-            self.set_architecture(ndim, nhidden=128, nblocks=5)
+            self.set_architecture(ndim, nhidden=128, nblock=5)
 
         flow = self._flow
         flow.to(self.device)

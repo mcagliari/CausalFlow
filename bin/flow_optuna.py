@@ -84,7 +84,7 @@ def Objective(trial):
             num_mixture_components=n_comp, 
             batch_norm=True)
 
-    flow, best_valid_log_prob = Cflow._train_flow(train_data[:,0], train_data[:,1:], 
+    flow, best_valid_loss = Cflow._train_flow(train_data[:,0], train_data[:,1:], 
             outcome_range=[[-1.], [6.]], 
             training_batch_size=50, 
             learning_rate=lr, 
@@ -94,7 +94,7 @@ def Objective(trial):
     fflow = os.path.join(output_dir, study_name, '%s.%i.pt' % (study_name, trial.number))
     torch.save(flow, fflow)
 
-    return -1*best_valid_log_prob
+    return best_valid_loss
 
 sampler     = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials) 
 study       = optuna.create_study(study_name=study_name, sampler=sampler, storage=storage, directions=["minimize"], load_if_exists=True) 

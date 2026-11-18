@@ -26,6 +26,8 @@ INSTALL_REQUIRES = [
         "sbi", 
         "optuna",
         "tarp",
+        "nflows",
+        "h5py",
         "tqdm"
 ]
 # END PROJECT SPECIFIC
@@ -68,7 +70,6 @@ if __name__ == "__main__":
         packages=PACKAGES,
         package_dir={"": "src"},
         include_package_data=True,
-        package_data={'sedflow': ['dat/*pt']},
         install_requires=INSTALL_REQUIRES,
         classifiers=CLASSIFIERS,
         zip_safe=True,

@@ -21,6 +21,7 @@ from torch import nn
 
 from sbi import utils as Ut
 from sbi import inference as Inference
+from sbi.neural_nets import posterior_nn
 
 from . import support as Support
 
@@ -65,6 +66,12 @@ class BaseCausalFlow(object):
 
             verbose: bool, If True the function will print informative messages
                 during the training.
+
+        returns:
+            flow: trained sbi posterior q(Y | X)
+
+            best_valid_loss: float, best loss (negative log-probability) on sbi's
+                internal validation split. Lower is better.
         '''
         # check outcome range
         if outcome_range[0] is None or outcome_range[1] is None: 
@@ -121,24 +128,30 @@ class BaseCausalFlow(object):
                 show_train_summary=verbose)
 
         flow = anpe.build_posterior(p_x_y_est)
-        # they changed the key in after v18 before v22 
-        if 'best_validation_log_probs' in anpe._summary.keys(): 
-            best_valid = anpe._summary['best_validation_log_probs'][0] 
-        elif 'best_validation_log_prob' in anpe._summary.keys(): 
-            best_valid = anpe._summary['best_validation_log_prob'][0] 
-        else: 
-            raise ValueError
-        return flow, best_valid
-    
-    def _load_flow(self, flow_name):
-        ''' given directory load flows. By default it will load an ensemble of
-        flows based on an optuna study. 
+        # sbi >= 0.23 only records the validation loss (lower is better)
+        best_valid_loss = anpe._summary['best_validation_loss'][-1]
+        return flow, best_valid_loss
 
-        args: 
-            flow_name: (str) specify the filename of the flow 
+    def _torch_load_flow(self, path):
+        ''' load a pickled sbi posterior onto self.device.
+
+        `map_location` moves the tensors, but the posterior also keeps its
+        device as a string (`_device`), used by `sample()` to place `x`; it is
+        reset here so that e.g. a GPU-trained flow samples on a CPU machine.
+        `weights_only=False` is needed for whole pickled objects (torch >= 2.6
+        defaults to True).
         '''
-        flow = torch.load(fqphi, map_location=self.device)
-        return flow 
+        flow = torch.load(path, map_location=self.device, weights_only=False)
+        flow._device = self.device
+        return flow
+
+    def _load_flow(self, flow_name):
+        ''' load a single flow, given its path and filename.
+
+        args:
+            flow_name: (str) specify the filename of the flow
+        '''
+        return self._torch_load_flow(flow_name)
 
     def _load_flows_optuna(self, study_name, study_dir, n_ensemble=5, verbose=False):
         ''' given directory load flows. By default it will load an ensemble of
@@ -169,7 +182,7 @@ class BaseCausalFlow(object):
         flows = []
         for i in ibest: 
             fflow = '%s/%s/%s.%i.pt' % (study_dir, study_name, study_name, i)
-            flows.append(torch.load(fflow, map_location=self.device))
+            flows.append(self._torch_load_flow(fflow))
         return flows 
 
     def set_architecture(self, arch='made', nhidden=64, ntransform=2, nblocks=2,
@@ -179,8 +192,11 @@ class BaseCausalFlow(object):
         default NDE architecture: Masked Autoencoder for Distribution
         Estimation (https://arxiv.org/abs/1502.03509) with arbitrary number of
         hidden features and blocks.
+
+        note: with sbi 0.25, `made` ignores `ntransform`, `nblocks` and
+        `batch_norm` (only `nhidden` and `num_mixture_components` are used).
         '''
-        self._nde = Ut.posterior_nn(arch, 
+        self._nde = posterior_nn(arch,
                     hidden_features=nhidden, 
                     num_transforms=ntransform, 
                     num_blocks=nblocks, 
@@ -223,29 +239,67 @@ class BaseCausalFlow(object):
 
         return np.concatenate(np.array(Yp), axis=0)
 
-    def _validate(self, flows, X_test, Y_test, Nsample=10000, verbose=False): 
-        ''' validate given flow using TARP (Lemos et al. 2023 
-        https://arxiv.org/abs/2302.03026v1). 
-        args: 
-            flow: flow object
+    @staticmethod
+    def _tarp_coverage(samples, Y, outcome_range):
+        ''' TARP coverage (Lemos et al. 2023, https://arxiv.org/abs/2302.03026)
+        of posterior samples against true outcomes.
 
-            X_test: N x D_x 2D array. Covariate values of the test dataset 
+        tarp draws its reference points from the unit hypercube, so samples
+        and Y are first rescaled to [0, 1] by the known bounds
+        `outcome_range` and tarp is called with norm=False (tarp's own
+        norm=True uses the empirical min/max of Y instead).
 
-            Y_test: N x D_y 2D array. Output values of the test dataset 
+        args:
+            samples: Nsample x N x D_y array of samples, one column per unit
 
-        kwargs: 
-            Nasmple: int, number of samples to draw from the flow 
+            Y: N x D_y array of true outcomes
 
-            verbose: bool, if True print some useful things 
+            outcome_range: [lower, upper] bounds, each of length D_y (same
+                format as in `_train_flow`)
 
-        returns: 
-            alpha: credibility level 
+        returns:
+            alpha: credibility level
 
-            ecp: expected coverage probabiilty 
+            ecp: expected coverage probability
         '''
-        from tarp import get_drp_coverage
+        from tarp import get_tarp_coverage
 
-        # deal with ensembles as well single flows 
+        low = np.array(outcome_range[0], dtype=float)
+        high = np.array(outcome_range[1], dtype=float)
+        samples_unit = (samples - low) / (high - low)
+        Y_unit = (Y - low) / (high - low)
+
+        ecp, alpha = get_tarp_coverage(samples_unit, Y_unit,
+                                       references="random", metric="euclidean",
+                                       norm=False, bootstrap=False)
+        return alpha, ecp
+
+    def _validate(self, flows, X_test, Y_test, outcome_range, Nsample=10000,
+                  verbose=False):
+        ''' validate given flow using TARP (Lemos et al. 2023
+        https://arxiv.org/abs/2302.03026v1). See `_tarp_coverage`.
+
+        args:
+            flows: flow object or list of flow objects (ensemble)
+
+            X_test: N x D_x 2D array. Covariate values of the test dataset
+
+            Y_test: N x D_y 2D array. Output values of the test dataset
+
+            outcome_range: [lower, upper] bounds of the outcome, as used for
+                training (`_train_flow`). Used to rescale Y to [0, 1].
+
+        kwargs:
+            Nsample: int, number of samples to draw from the flow
+
+            verbose: bool, if True print some useful things
+
+        returns:
+            alpha: credibility level
+
+            ecp: expected coverage probability
+        '''
+        # deal with ensembles as well single flows
         if not isinstance(flows, list): flows = [flows]
         Nflow = len(flows) # nubmer of flows in the ensemble 
 
@@ -270,9 +324,8 @@ class BaseCausalFlow(object):
             y_flow.append(np.concatenate(np.array(y_samp), axis=0))
         y_flow = np.array(y_flow)
 
-        alpha, ecp = get_drp_coverage(np.swapaxes(y_flow, 0, 1), Y_test,
-                              references="random", metric="euclidean")
-        return alpha, ecp
+        return self._tarp_coverage(np.swapaxes(y_flow, 0, 1), Y_test,
+                                   outcome_range)
 
 
 class CausalFlowA(BaseCausalFlow): 
@@ -317,18 +370,18 @@ class CausalFlowA(BaseCausalFlow):
                 perform on the flow outputs before calculating the CATE. This
                 is if, e.g., you take train the flows on log Y. 
         '''
-        if self.support_treated is None or self.support_control is None: 
+        # check support before evaluating CATE
+        if self.support_treated is None or self.support_control is None:
             warnings.warn("No support flows specified! Cannot check support!")
-
-        # check support before evaluating CATE 
-        support_t = self.support_treated.check_support(X, Nsample=Nsupport,
-                                           threshold=support_threshold)[0] 
-        support_c = self.support_control.check_support(X, Nsample=Nsupport,
-                                           threshold=support_threshold)[0]
-        if not support_t:
-            warnings.warn("covariate is out of the treated sample support!")
-        if not support_c:
-            warnings.warn("covariate is out of the control sample support!")
+        else:
+            support_t = self.support_treated.check_support(X, Nsample=Nsupport,
+                                               threshold=support_threshold)[0]
+            support_c = self.support_control.check_support(X, Nsample=Nsupport,
+                                               threshold=support_threshold)[0]
+            if not support_t:
+                warnings.warn("covariate is out of the treated sample support!")
+            if not support_c:
+                warnings.warn("covariate is out of the control sample support!")
 
         # sample p( Y | X, T=1 ) 
         Ys_treated = self._sample(self.flow_treated, X, Nsample=Nsample,
@@ -356,12 +409,12 @@ class CausalFlowA(BaseCausalFlow):
         return None  
     
     def train_flow_control(self, Y_cont, X_cont, **kwargs):
-        ''' Train a flow for the treated sample to estimate p( Y | X, T=0 ). 
+        ''' Train a flow for the control sample to estimate p( Y | X, T=0 ).
         This is a wrapper for self._train_flow. See self._train_flow for
-        documentation and detail on training. 
+        documentation and detail on training.
         '''
-        if self.flow_control is not None: 
-            warnings.warn("Overwriting existing flow_treated. clt+c if you don't want to do this")
+        if self.flow_control is not None:
+            warnings.warn("Overwriting existing flow_control. clt+c if you don't want to do this")
 
         self.flow_control, _ = self._train_flow(Y_cont, X_cont, **kwargs) 
         return None  
@@ -383,7 +436,7 @@ class CausalFlowA(BaseCausalFlow):
         args: 
             flow_name: (str) specify the path and filename of the flow
         '''
-        self.flow_treated = self._load_flow(flow_name) 
+        self.flow_control = self._load_flow(flow_name)
         return None 
     
     def load_flows_optuna_treated(self, study_name, study_dir, n_ensemble=5, verbose=False):
@@ -403,7 +456,7 @@ class CausalFlowA(BaseCausalFlow):
         return None 
 
     def load_flows_optuna_control(self, study_name, study_dir, n_ensemble=5, verbose=False):
-        ''' load an ensemble of flows that estimates p( Y | X, T=1 ) that were 
+        ''' load an ensemble of flows that estimates p( Y | X, T=0 ) that were
         trained using the optuna hyperparameter optimization framework. 
         
         args: 
@@ -512,14 +565,14 @@ class CausalFlowB(BaseCausalFlow):
                 perform on the flow outputs before calculating the CATE. This
                 is if, e.g., you take train the flows on log Y. 
         '''
-        if self.support_base is None: 
+        # check support before evaluating CATE
+        if self.support_base is None:
             warnings.warn("No support flows specified! Cannot check support!")
-
-        # check support before evaluating CATE 
-        support_base = self.support_base.check_support(X, Nsample=Nsupport,
-                                                       threshold=support_threshold)[0]
-        if not support_base:
-            warnings.warn("covariate is out of the base sample support!")
+        else:
+            support_base = self.support_base.check_support(X, Nsample=Nsupport,
+                                                           threshold=support_threshold)[0]
+            if not support_base:
+                warnings.warn("covariate is out of the base sample support!")
 
         # sample p( Y | X, T=1 ) 
         Ys_base = self._sample(self.flow_base, X, Nsample=Nsample,
@@ -558,12 +611,14 @@ class CausalFlowB(BaseCausalFlow):
                 is if, e.g., you take train the flows on log Y. 
         '''
 
-        if self.support_base is None: 
-            warnings.warn("No support flows specified! Cannot check support!")
-
-        # check support before evaluating CATE 
-        support_base = self.support_base.check_support(Xs, Nsample=Nsupport,
-                threshold=support_threshold)
+        # check support before evaluating CATE
+        if self.support_base is None:
+            warnings.warn("No support flows specified! Cannot check support! "
+                          "All units are included.")
+            support_base = np.ones(Xs.shape[0], dtype=bool)
+        else:
+            support_base = self.support_base.check_support(Xs, Nsample=Nsupport,
+                    threshold=support_threshold)
 
         if np.any(~support_base):
             warnings.warn("%i of %i covariates are out of the base sample support! They will be excluded" % (np.sum(~support_base), Xs.shape[0]))
@@ -696,20 +751,20 @@ class CausalFlowC(BaseCausalFlow):
                 perform on the flow outputs before calculating the CATE. This
                 is if, e.g., you take train the flows on log Y. 
         '''
-        if self.support is None: 
-            warnings.warn("No support flows specified! Cannot check support!")
+        XT_fid = np.concatenate([X_fid, T_fid])
+        XT_dfid = np.concatenate([X_fid, T_fid + dT])
 
-        # check support before evaluating CATE 
-        XT_fid = np.concatenate([X_fid, T_fid]) 
-        supported = self.support.check_support(XT_fid, Nsample=Nsupport,
-                                             threshold=support_threshold)[0]
-        if not supported: warnings.warn("(Xfid, Tfid) is out of support!")
-        
-        # check support before evaluating CATE 
-        XT_dfid = np.concatenate([X_fid, T_fid + dT]) 
-        supported = self.support.check_support(XT_dfid, Nsample=Nsupport,
-                                             threshold=support_threshold)[0]
-        if not supported: warnings.warn("(Xfid, Tfid + dT) is out of support!")
+        # check support before evaluating CATE
+        if self.support is None:
+            warnings.warn("No support flows specified! Cannot check support!")
+        else:
+            supported = self.support.check_support(XT_fid, Nsample=Nsupport,
+                                                 threshold=support_threshold)[0]
+            if not supported: warnings.warn("(Xfid, Tfid) is out of support!")
+
+            supported = self.support.check_support(XT_dfid, Nsample=Nsupport,
+                                                 threshold=support_threshold)[0]
+            if not supported: warnings.warn("(Xfid, Tfid + dT) is out of support!")
 
         # sample p( Y | X_fid, T_fid ) 
         Ys_fid = self._sample(self.flow, XT_fid, Nsample=Nsample,
