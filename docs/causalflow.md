@@ -72,10 +72,23 @@ before averaging (e.g. `10**x` for flows trained on log10 Y → mean of 10**Y).
 - **Saved models** are whole pickled sbi posteriors: they load only under matching
   library versions. GPU-trained → CPU: after `torch.load(..., map_location='cpu')` set
   `flow._device = 'cpu'` (`map_location` does not touch that string).
-- **TARP (`_validate`).** `references="random"` draws reference points in the unit hypercube,
-  so Y must be rescaled to [0, 1] (e.g. by `outcome_range`) before calling — matters in 1-D
-  too. Do not use tarp's `bootstrap=True`. TARP cannot separate bias from width; pair it
-  with point-estimate checks.
+- **TARP (`_validate`)** — checked against installed tarp 0.1.1 (`tarp/drp.py`):
+  - `get_drp_coverage` is a deprecated wrapper (removal planned in 0.2.0) that returns
+    `get_tarp_coverage(..., norm=True)`, i.e. **`(ecp, alpha)`**. `_validate` unpacks it as
+    `alpha, ecp` → under tarp 0.1.1 the two outputs are **swapped** (bug, Plan §3).
+  - `references="random"` are **always** drawn from U[0,1]^D (hard-coded), whatever `norm`.
+    `norm=True` maps samples and Y into that cube by the empirical min/max of the *test-set*
+    Y; flow samples outside that range land outside [0,1] (tarp issue #14, an asymmetry that
+    grows with dimension). `norm=False` on raw units leaves the references off the data.
+  - **Recommended (from simbig2, measured there):** rescale samples and Y by the known
+    bounds — here `outcome_range`, which sbi enforces on samples — then call with
+    `norm=False`. simbig2 found this offset-invariant, while raw `norm=False` inflated a
+    known bias ~3.3× and distorted its shape; it is not a no-op in 1-D (curves moved by up
+    to 0.30). Not yet re-measured on CausalFlow outcomes (inference that it transfers).
+  - Do not use `bootstrap=True`: each iteration overwrites one simulation with another,
+    cumulatively and **in place** (mutates the caller's arrays). simbig2 measured its σ
+    ~15% too small and replaced it with a proper resampling bootstrap.
+  - TARP cannot separate bias from width; pair it with point-estimate checks.
 - **Duplication.** Subclasses differ only in which models they hold and the estimator
   formula; `train_support_*` (×4) and `load_*` (×8) are copy-pasted, which is where the
   `load_flow_control` bug comes from.
