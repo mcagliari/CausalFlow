@@ -68,7 +68,11 @@ before averaging (e.g. `10**x` for flows trained on log10 Y → mean of 10**Y).
   year/event (new storms), or by row (known places, new covariates). Rows repeated per
   zipcode (zipcode × month in FEMA) leak through a random split. Selection over many Optuna
   trials also overfits the validation set, so final checks need a separate, untouched test
-  set. Data structure still to be measured in a notebook.
+  set. **Decided 2026-11-19 (not yet implemented):** grouping is selectable — the library
+  takes an optional `groups` array (group-disjoint split; `None` → random rows, the
+  default); applications map their own keys to it (floody: `random` / zipcode /
+  year-month). sbi's internal early-stopping split stays random (no `get_dataloaders`
+  override). Arguments per option: workspace `Plan.md` §3b.
 - **1-D outcome.** For D_y = 1, sbi's `maf` reduces to a Gaussian; `made` with
   `num_mixture_components > 1` (mixture of Gaussians) is the flexible option.
 - **`made` in sbi 0.25 ignores most architecture kwargs.** `build_made`
