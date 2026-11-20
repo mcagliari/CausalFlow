@@ -3,7 +3,7 @@
 Treatment-effect estimators built on conditional normalizing flows q(Y | X).
 Reference: Cano & Hahn (2024), arXiv:2312.03843. Support checks: [`support.md`](support.md).
 Status: upstream `e73a4f6` + step-3a port to sbi 0.25 (branch `work`, 2026-11-18; verified by
-workspace `notebooks/01_causalflow_smoke.ipynb`). Open issues → workspace `Plan.md` §3.
+workspace `notebooks/01_causalflow_smoke.ipynb`) + step-3b validation split (2026-11-20, notebook 06). Open issues → workspace `Plan.md` §3.
 
 ## Public API
 
@@ -13,13 +13,14 @@ Shared machinery; `device` defaults to `'cuda'` if available, else `'cpu'`.
 | method | does | returns |
 |---|---|---|
 | `set_architecture(arch='made', nhidden=64, ntransform=2, nblocks=2, num_mixture_components=2, batch_norm=True)` | stores an `sbi.neural_nets.posterior_nn` builder in `self._nde` (for `made`, only `nhidden` and `num_mixture_components` take effect, see notes) | `None` |
-| `_train_flow(Y, X, outcome_range, inverse_cdf=False, training_batch_size=50, learning_rate=5e-4, verbose=False)` | trains q(Y\|X) with sbi SNPE; Y, X as N×D arrays (1-D promoted) | `(flow, best_valid_loss)`: sbi's `best_validation_loss` on its internal split, **lower is better** (was a log-prob before the port) |
+| `_train_flow(Y, X, outcome_range, inverse_cdf=False, training_batch_size=50, learning_rate=5e-4, seed=None, verbose=False, **train_kwargs)` | trains q(Y\|X) with sbi SNPE; Y, X as N×D arrays (1-D promoted). `seed` → `torch.manual_seed` (global) before training; `train_kwargs` → sbi `train` (`validation_fraction`, `stop_after_epochs`, `max_num_epochs`, `clip_max_norm`) | `(flow, best_valid_loss)`: sbi's `best_validation_loss` on its internal split, **lower is better** (was a log-prob before the port) |
+| `validation_loss(flow, Y, X, batch_size=10000)` | mean −log q(Y\|X) over held-out data via `flow.posterior_estimator.loss` — the quantity sbi minimizes; the hyper-parameter objective on an external (e.g. group-disjoint) validation set | float, lower is better |
 | `_sample(flows, X, Nsample=10000, progress_bar=False)` | draws Y ~ q(Y\|X) at one X; `flows` may be a list (ensemble) | `(Nsample, D_y)` array |
 | `_tarp_coverage(samples, Y, outcome_range)` (static) | rescales samples (Nsample×N×D_y) and Y (N×D_y) to [0,1] by `outcome_range`, then `tarp.get_tarp_coverage(norm=False)` | `(alpha, ecp)` |
 | `_validate(flows, X_test, Y_test, outcome_range, Nsample=10000, verbose=False)` | samples q(Y\|X_test) and calls `_tarp_coverage`; `outcome_range` **required** (as in training) | `(alpha, ecp)` |
 | `_torch_load_flow(path)` | `torch.load(map_location=device, weights_only=False)`, then `flow._device = device` | flow |
 | `_load_flow(flow_name)` | one pickled flow via `_torch_load_flow` | flow |
-| `_load_flows_optuna(study_name, study_dir, n_ensemble=5, verbose=False)` | loads the `n_ensemble` lowest-objective trials from `<dir>/<study>/<study>.db` (SQLite) + `<study>.<trial>.pt` | list of flows |
+| `_load_flows_optuna(study_name, study_dir, n_ensemble=5, verbose=False)` | loads the `n_ensemble` lowest-objective completed trials; layout and journal storage in [`study.md`](study.md) (SQLite until 2026-11-20) | list of flows |
 
 ### `CausalFlowA(device=None)` — binary treatment, both arms well sampled
 Holds `flow_treated`, `flow_control`, `support_treated`, `support_control`.
@@ -68,11 +69,22 @@ before averaging (e.g. `10**x` for flows trained on log10 Y → mean of 10**Y).
   year/event (new storms), or by row (known places, new covariates). Rows repeated per
   zipcode (zipcode × month in FEMA) leak through a random split. Selection over many Optuna
   trials also overfits the validation set, so final checks need a separate, untouched test
-  set. **Decided 2026-11-19 (not yet implemented):** grouping is selectable — the library
-  takes an optional `groups` array (group-disjoint split; `None` → random rows, the
-  default); applications map their own keys to it (floody: `random` / zipcode /
-  year-month). sbi's internal early-stopping split stays random (no `get_dataloaders`
-  override). Arguments per option: workspace `Plan.md` §3b.
+  set. **Implemented 2026-11-20:** grouping is selectable — [`split.md`](split.md) takes an
+  optional `groups` array (group-disjoint split; `None` → random rows, the default);
+  applications map their own keys to it (floody: `random` / zipcode / year-month) and
+  score trials with `validation_loss` on the external validation set. sbi's internal
+  early-stopping split stays random (no `get_dataloaders` override). Tested in
+  `tests/test_validation_loss.py`: `validation_loss` on sbi's own `val_indices` = its
+  `best_validation_loss`; `Support.validation_loss` = `_train`'s best loss; same `seed` →
+  same flow. Arguments per option: workspace `Plan.md` §3b.
+- **sbi 0.25 training quirks** (read in `sbi/inference/trainers`):
+  - the internal validation loss is divided by (number of batches × batch size), not by
+    the number of validation rows → slightly low when the last batch is partial;
+    `validation_loss` is an exact mean.
+  - the best-epoch weights are restored only when training *converges*
+    (`stop_after_epochs`); if `max_num_epochs` stops it, the flow keeps the last epoch's
+    weights while `best_validation_loss` refers to an earlier epoch. Cap epochs in tests
+    only.
 - **1-D outcome.** For D_y = 1, sbi's `maf` reduces to a Gaussian; `made` with
   `num_mixture_components > 1` (mixture of Gaussians) is the flexible option.
 - **`made` in sbi 0.25 ignores most architecture kwargs.** `build_made`
@@ -83,7 +95,9 @@ before averaging (e.g. `10**x` for flows trained on log10 Y → mean of 10**Y).
 - **Ensembles** are plain lists, equal-weight mixtures: each member contributes
   `int(Nsample / Nflow)` draws.
 - **Saved models** are whole pickled sbi posteriors: they load only under matching
-  library versions. `_torch_load_flow` handles GPU-trained → CPU (`map_location` moves the
+  library versions. Kept deliberately (decided 2026-11-20, as in simbig2; state_dict +
+  config rejected for now: it would still break when sbi changes a builder); version
+  matching is tracked by per-machine lock files in the workspace. `_torch_load_flow` handles GPU-trained → CPU (`map_location` moves the
   tensors but not the pickled `_device` string, which it resets) and passes
   `weights_only=False` (torch ≥ 2.6 defaults to True, which refuses whole objects).
 - **TARP (`_validate`)** — checked against installed tarp 0.1.1 (`tarp/drp.py`):
@@ -115,7 +129,9 @@ before averaging (e.g. `10**x` for flows trained on log10 Y → mean of 10**Y).
   (fixed) `load_flow_control` bug came from.
 - **Multi-dimensional Y.** `np.mean` in the estimators averages over all axes: correct
   only for D_y = 1.
-- **Reproducibility.** No seeding of flows or of sbi's split (`torch.randperm`).
+- **Reproducibility.** `_train_flow(seed=...)` seeds torch's global RNG (sbi takes no
+  generator): initialization, sbi's split (`torch.randperm`) and batches. GPU runs may
+  still differ slightly. Default `None` = unseeded, as before.
 
 ## Cross-references
 - Workspace `Plan.md` §2 (versions), §3 (bugs, validation split, TARP).
