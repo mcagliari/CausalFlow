@@ -24,6 +24,7 @@ from sbi import inference as Inference
 from sbi.neural_nets import posterior_nn
 
 from . import support as Support
+from . import study as Study
 
 
 class BaseCausalFlow(object): 
@@ -39,9 +40,10 @@ class BaseCausalFlow(object):
         self._nde = None 
 
     def _train_flow(self, Y, X, outcome_range=[None, None], inverse_cdf=False,
-                    training_batch_size=50, learning_rate=5e-4, verbose=False): 
+                    training_batch_size=50, learning_rate=5e-4, seed=None,
+                    verbose=False, **train_kwargs):
         ''' Train a normalizing flow by providing the outcome, Y, and
-        covariates, X. 
+        covariates, X.
 
         args: 
             Y: N x D_y array specifying the outcomes. N is the number of data
@@ -62,10 +64,21 @@ class BaseCausalFlow(object):
                 during training (Default: 50)
 
             learning_rate: float, specifying the learning rate used for
-                training (Default: 5e-4) 
+                training (Default: 5e-4)
+
+            seed: int or None. If set, torch's global RNG is seeded with it
+                before training (network initialization, sbi's internal
+                validation split, batches). sbi takes no generator argument,
+                so this resets the caller's global torch state. GPU runs may
+                still differ slightly (non-deterministic kernels).
 
             verbose: bool, If True the function will print informative messages
                 during the training.
+
+            **train_kwargs: passed to sbi's `train`, e.g. `validation_fraction`
+                (internal early-stopping split, default 0.1),
+                `stop_after_epochs` (patience, default 20), `max_num_epochs`,
+                `clip_max_norm` (default 5).
 
         returns:
             flow: trained sbi posterior q(Y | X)
@@ -91,8 +104,10 @@ class BaseCausalFlow(object):
         # add any other checks we want to implement here. 
 
 
-        # training the flow 
-        # set prior 
+        if seed is not None: torch.manual_seed(seed)
+
+        # training the flow
+        # set prior
         lower_bounds = torch.tensor(outcome_range[0]).to(self.device)
         upper_bounds = torch.tensor(outcome_range[1]).to(self.device)
         prior = Ut.BoxUniform(low=lower_bounds, high=upper_bounds, device=self.device)
@@ -125,12 +140,37 @@ class BaseCausalFlow(object):
         p_x_y_est = anpe.train(
                 training_batch_size=training_batch_size,
                 learning_rate=learning_rate,
-                show_train_summary=verbose)
+                show_train_summary=verbose,
+                **train_kwargs)
 
         flow = anpe.build_posterior(p_x_y_est)
         # sbi >= 0.23 only records the validation loss (lower is better)
         best_valid_loss = anpe._summary['best_validation_loss'][-1]
         return flow, best_valid_loss
+
+    def validation_loss(self, flow, Y, X, batch_size=10000):
+        ''' mean negative log-probability of held-out data (Y, X) under a
+        trained flow: the same quantity sbi minimizes (and reports as
+        `best_validation_loss` on its internal split), so it can serve as a
+        hyper-parameter objective on an external, e.g. group-disjoint,
+        validation set. Lower is better. Like sbi's loss, it does not account
+        for probability mass outside `outcome_range`.
+
+        args:
+            flow: trained sbi posterior (as returned by `_train_flow`)
+            Y: N x D_y array, X: N x D_x array (1-D promoted as in training)
+        '''
+        if len(Y.shape) == 1: Y = np.atleast_2d(Y).T
+        if len(X.shape) == 1: X = np.atleast_2d(X).T
+        net = flow.posterior_estimator
+        net.eval()
+        total = 0.
+        with torch.no_grad():
+            for i in range(0, Y.shape[0], batch_size):
+                y = torch.as_tensor(Y[i:i+batch_size].astype(np.float32)).to(self.device)
+                x = torch.as_tensor(X[i:i+batch_size].astype(np.float32)).to(self.device)
+                total += net.loss(y, x).sum().item()
+        return total / Y.shape[0]
 
     def _torch_load_flow(self, path):
         ''' load a pickled sbi posterior onto self.device.
@@ -154,36 +194,19 @@ class BaseCausalFlow(object):
         return self._torch_load_flow(flow_name)
 
     def _load_flows_optuna(self, study_name, study_dir, n_ensemble=5, verbose=False):
-        ''' given directory load flows. By default it will load an ensemble of
-        flows based on an optuna study. 
+        ''' load the ensemble of the n_ensemble best flows (lowest objective)
+        of an optuna study; file layout in `causalflow.study`.
 
-        args: 
+        args:
             study_name: str, name of optuna study
 
             study_dir: str, directory path where the optuna study is located
 
-        kwargs: 
-            n_ensemble: (int) specifying the number of flows in the ensemble. 
+        kwargs:
+            n_ensemble: (int) specifying the number of flows in the ensemble.
         '''
-        import optuna 
-        storage    = 'sqlite:///%s/%s/%s.db' % (study_dir, study_name, study_name)
-        study = optuna.load_study(study_name=study_name, storage=storage)
-
-        ntrial, values = [], [] 
-        for trial in study.trials:
-            if trial.values is not None:
-                ntrial.append(trial.number)
-                values.append(trial.values)
-        if verbose: print('select %i out of %i flows' % (n_ensemble, len(ntrial)))
-
-        ibest = np.array(ntrial)[np.argsort(np.concatenate(values))[:n_ensemble]]
-
-        # try to load optuna study to determine the n_ensemble best flows. 
-        flows = []
-        for i in ibest: 
-            fflow = '%s/%s/%s.%i.pt' % (study_dir, study_name, study_name, i)
-            flows.append(self._torch_load_flow(fflow))
-        return flows 
+        best = Study.best_trials(study_dir, study_name, n=n_ensemble, verbose=verbose)
+        return [self._torch_load_flow(Study.trial_file(study_dir, study_name, i)) for i in best]
 
     def set_architecture(self, arch='made', nhidden=64, ntransform=2, nblocks=2,
                          num_mixture_components=2, batch_norm=True):

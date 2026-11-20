@@ -14,6 +14,8 @@ from torch import optim
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from tqdm.auto import tqdm
 
+from . import study as Study
+
 
 class Support(object): 
     def __init__(self, device=None): 
@@ -65,7 +67,7 @@ class Support(object):
             return (support < threshold)
 
     def train(self, X, inverse_cdf=False, batch_size=50,
-              learning_rate=5e-4, num_iter=300, clip_max_norm=5,
+              learning_rate=5e-4, num_iter=300, clip_max_norm=5, seed=0,
               verbose=False): 
         ''' Train a normalizing flow by providing the outcome, Y, and
         covariates, X. This function is a wrapper for `_train` and overwrites
@@ -96,7 +98,7 @@ class Support(object):
 
         flow, _ = self._train(X, inverse_cdf=inverse_cdf, batch_size=batch_size,
                            num_iter=num_iter, learning_rate=learning_rate,
-                           clip_max_norm=clip_max_norm, verbose=verbose)
+                           clip_max_norm=clip_max_norm, seed=seed, verbose=verbose)
         self.flow_support = flow
         return None 
 
@@ -111,43 +113,41 @@ class Support(object):
         '''
         if self.flow_support is not None: 
             warnings.warn("Overwriting existing flow_support. clt+c if you don't want to do this!")
-        self.flow_support = torch.load(file_flow, map_location=self.device)
+        self.flow_support = torch.load(file_flow, map_location=self.device, weights_only=False)
         return None 
     
     def load_optuna(self, study_name, study_dir, verbose=False):
-        ''' load flow that estimates p( X ) best from an optuna study
+        ''' load the best flow (lowest objective) of an optuna study as the
+        support flow p( X ); file layout in `causalflow.study`. No ensemble.
 
         args: 
             study_name: str, name of optuna study
 
             study_dir: str, directory path where the optuna study is located
-
-        kwargs: 
-            n_ensemble: (int) specifying the number of flows in the ensemble. 
-
         '''
         if self.flow_support is not None: 
             warnings.warn("Overwriting existing flow_support. clt+c if you don't want to do this!")
-        import optuna 
-        storage    = 'sqlite:///%s/%s/%s.db' % (study_dir, study_name, study_name)
-        study = optuna.load_study(study_name=study_name, storage=storage)
-
-        ntrial, values = [], [] 
-        for trial in study.trials:
-            if trial.values is not None:
-                ntrial.append(trial.number)
-                values.append(trial.values)
-        if verbose: print('select best flow out of %i flows' % len(ntrial))
-
-        ibest = np.array(ntrial)[np.argmin(np.concatenate(values))]
-
-        # load flows with best loss. 
-        fflow = '%s/%s/%s.%i.pt' % (study_dir, study_name, study_name, ibest)
-        self.flow_support = torch.load(fflow, map_location=self.device)
+        best = Study.best_trials(study_dir, study_name, n=1, verbose=verbose)[0]
+        self.flow_support = torch.load(Study.trial_file(study_dir, study_name, best),
+                                       map_location=self.device, weights_only=False)
         return None 
 
+    def validation_loss(self, flow, X, batch_size=10000): 
+        ''' mean negative log-probability of held-out covariates X under a
+        trained flow (the quantity `_train` minimizes); lower is better. Use
+        it as a hyper-parameter objective on an external validation set.
+        '''
+        X = np.atleast_2d(X)
+        flow.eval()
+        total = 0.
+        with torch.no_grad(): 
+            for i in range(0, X.shape[0], batch_size): 
+                x = torch.tensor(X[i:i+batch_size].astype(np.float32)).to(self.device)
+                total += -flow.log_prob(x).sum().item()
+        return total / X.shape[0]
+
     def _train(self, X, inverse_cdf=False, batch_size=50, num_iter=300,
-               learning_rate=5e-4, clip_max_norm=5, verbose=False): 
+               learning_rate=5e-4, clip_max_norm=5, seed=0, verbose=False): 
         ''' Train a normalizing flow by providing the outcome, Y, and
         covariates, X. 
 
@@ -172,6 +172,11 @@ class Support(object):
 
             clip_max_norm: float, clip gradients 
 
+            seed: int or None, seed of the local generator for the random
+                90/10 train/validation split (early stopping). The global
+                numpy state is not touched. Weight initialization happens in
+                `set_architecture` and is not seeded here.
+
             verbose: bool, If True the function will print informative messages
                 during the training.
         '''
@@ -186,9 +191,7 @@ class Support(object):
         if verbose: print('Ntrain= %i, Nvalid= %i' % (Ntrain, X.shape[0] - Ntrain))
 
         # shuffle up the data 
-        np.random.seed(0)
-        ind = np.arange(X.shape[0])
-        np.random.shuffle(ind)
+        ind = np.random.default_rng(seed).permutation(X.shape[0])
 
         data_train = X[ind][:Ntrain]
         data_valid = X[ind][Ntrain:]
